@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nina's Screen</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+:root{--bg:#f6f5f2;--fg:#1c1b19;--muted:#6b6862;--card:#fff;--line:#e3e0da;--accent:#d2462f}
+@media (prefers-color-scheme:dark){:root{--bg:#141413;--fg:#efede8;--muted:#9a968e;--card:#1e1d1b;--line:#2f2d2a;--accent:#ef6a52}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,system-ui,sans-serif}
+main{max-width:1200px;margin:0 auto;padding:24px 16px}
+header{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:16px}
+h1{font-size:22px;margin:0}
+p{margin:0 0 12px;color:var(--muted)}
+.badge{display:inline-flex;align-items:center;gap:6px;font-weight:600;font-size:14px;padding:4px 10px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+.badge::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.badge.live{color:var(--accent);border-color:var(--accent)}
+.badge.live::before{background:var(--accent);animation:p 1.2s infinite}
+@keyframes p{50%{opacity:.3}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
+button{font:inherit;padding:9px 16px;border-radius:8px;border:1px solid var(--line);background:var(--fg);color:var(--bg);cursor:pointer}
+button.secondary{background:transparent;color:var(--fg)}
+.stage{background:#000;border-radius:12px;aspect-ratio:16/9;display:grid;place-items:center;overflow:hidden}
+.stage video{width:100%;height:100%;object-fit:contain;display:none}
+.stage .msg{color:#aaa;text-align:center;padding:16px}
+.status{color:var(--muted);font-size:14px;margin-top:8px}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<main>
+  <header><h1 id="title">Nina's Screen</h1><span class="badge" id="badge">Offline</span></header>
+  <div id="host" class="hidden">
+    <div class="card" id="keyCard">
+      <p>Load your private key file (broadcaster-key-KEEP-PRIVATE.json). It stays in this browser only.</p>
+      <input type="file" id="keyFile" accept=".json,application/json">
+    </div>
+    <div class="card hidden" id="controls">
+      <button id="startBtn">Start streaming</button>
+      <button id="stopBtn" class="hidden">Stop</button>
+      <button id="forgetBtn" class="secondary">Forget key</button>
+    </div>
+  </div>
+  <div class="stage">
+    <video id="video" autoplay playsinline muted controls></video>
+    <div class="msg" id="msg">Not streaming right now. This page connects automatically when the stream starts.</div>
+  </div>
+  <div class="status" id="status"></div>
+</main>
+<script>
+const HOST_ID = "nina-screen-23e49b129e";
+const PUBLIC_KEY = {"kty":"EC","crv":"P-256","x":"2SOPzhDnulUjwJ7VY9vxYM_BmtNa5IlvDproW0d-oWE","y":"PzYoTy2QQsQO8xw4vxvAhJC24WUCA-2kbPiwg6BMEFA"};
+const PEER_OPTS = { config: { iceServers: [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:global.stun.twilio.com:3478" }] } };
+const ALG = { name: "ECDSA", hash: "SHA-256" }, CURVE = { name: "ECDSA", namedCurve: "P-256" };
+const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const $ = id => document.getElementById(id);
+const video = $("video"), msg = $("msg");
+const setStatus = t => $("status").textContent = t;
+function setLive(on, text){
+  $("badge").className = "badge" + (on ? " live" : "");
+  $("badge").textContent = on ? "Live" : "Offline";
+  video.style.display = on ? "block" : "none";
+  msg.style.display = on ? "none" : "block";
+  if (text) msg.textContent = text;
+}
+let peer;
+
+/* ---------- Viewer: the normal page ---------- */
+function viewer(){
+  let conn, verified = false, retryTimer, pubKey;
+  const retry = () => { clearTimeout(retryTimer); retryTimer = setTimeout(connect, 5000); };
+  function connect(){
+    verified = false;
+    if (!peer || peer.destroyed || peer.disconnected) return initPeer();
+    const nonce = crypto.getRandomValues(new Uint8Array(32));
+    conn = peer.connect(HOST_ID, { reliable: true });
+    conn.on("open", () => conn.send({ type: "hello", nonce: b64(nonce) }));
+    conn.on("data", async d => {
+      if (d?.type !== "proof" || typeof d.sig !== "string") return;
+      const ok = await crypto.subtle.verify(ALG, pubKey, unb64(d.sig), nonce).catch(() => false);
+      if (!ok) { setStatus("Ignored an unverified stream."); conn.close(); return; }
+      verified = true; conn.send({ type: "ready" });
+    });
+    conn.on("close", () => { setLive(false, "The stream ended. Reconnecting when it's back…"); retry(); });
+  }
+  function initPeer(){
+    peer?.destroy();
+    peer = new Peer(undefined, PEER_OPTS);
+    peer.on("open", connect);
+    peer.on("call", call => {
+      if (call.peer !== HOST_ID || !verified) { call.close(); return; }
+      call.answer();
+      call.on("stream", s => { video.srcObject = s; setLive(true); setStatus("Click the video to unmute or go fullscreen."); });
+      call.on("close", () => { setLive(false, "The stream ended."); retry(); });
+    });
+    peer.on("error", e => {
+      if (e.type === "peer-unavailable") setLive(false, "Not streaming right now. This page connects automatically when the stream starts.");
+      else setStatus("Connection issue (" + e.type + "), retrying…");
+      retry();
+    });
+    peer.on("disconnected", retry);
+  }
+  crypto.subtle.importKey("jwk", PUBLIC_KEY, CURVE, false, ["verify"]).then(k => { pubKey = k; initPeer(); });
+}
+
+/* ---------- Broadcaster: this page with #broadcast at the end ---------- */
+function broadcaster(){
+  const KEY_STORE = "screen-broadcaster-key";
+  let privKey, stream, viewers = new Set();
+  $("title").textContent = "Broadcast my screen";
+  $("host").classList.remove("hidden");
+  video.controls = false;
+  msg.textContent = "Preview appears here while you stream.";
+  const count = () => setStatus(`${viewers.size} viewer${viewers.size === 1 ? "" : "s"} watching`);
+
+  async function useKey(jwk){
+    if (jwk.x !== PUBLIC_KEY.x || jwk.y !== PUBLIC_KEY.y) throw new Error("This key doesn't match the site.");
+    privKey = await crypto.subtle.importKey("jwk", jwk, CURVE, false, ["sign"]);
+    $("keyCard").classList.add("hidden"); $("controls").classList.remove("hidden");
+  }
+  $("keyFile").onchange = async e => {
+    try { const jwk = JSON.parse(await e.target.files[0].text()); await useKey(jwk); try { localStorage.setItem(KEY_STORE, JSON.stringify(jwk)); } catch {} }
+    catch (err) { setStatus(err.message || "Couldn't read that key file."); }
+  };
+  $("forgetBtn").onclick = () => { try { localStorage.removeItem(KEY_STORE); } catch {} location.reload(); };
+  try { const s = localStorage.getItem(KEY_STORE); if (s) useKey(JSON.parse(s)); } catch {}
+
+  async function start(){
+    try { stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: true }); }
+    catch { setStatus("Screen sharing was cancelled or blocked."); return; }
+    stream.getVideoTracks()[0].addEventListener("ended", stop);
+    video.srcObject = stream; video.style.display = "block"; msg.style.display = "none";
+    goLive();
+  }
+  function goLive(){
+    setStatus("Going live…");
+    peer = new Peer(HOST_ID, PEER_OPTS);
+    peer.on("open", () => { setLive(true); $("startBtn").classList.add("hidden"); $("stopBtn").classList.remove("hidden"); count(); });
+    peer.on("connection", conn => {
+      conn.on("data", async d => {
+        if (d?.type === "hello" && typeof d.nonce === "string") {
+          conn.send({ type: "proof", sig: b64(await crypto.subtle.sign(ALG, privKey, unb64(d.nonce))) });
+        } else if (d?.type === "ready" && !viewers.has(conn.peer)) {
+          const call = peer.call(conn.peer, stream);
+          viewers.add(conn.peer); count();
+          const drop = () => { viewers.delete(conn.peer); count(); };
+          call.on("close", drop); call.on("error", drop); conn.on("close", drop);
+        }
+      });
+    });
+    peer.on("error", e => {
+      if (e.type === "unavailable-id") { setStatus("Still held from a previous session. Retrying in 10 seconds…"); peer.destroy(); setTimeout(() => { if (stream?.active) goLive(); }, 10000); }
+      else setStatus("Error: " + e.type);
+    });
+    peer.on("disconnected", () => { if (!peer.destroyed) peer.reconnect(); });
+  }
+  function stop(){
+    stream?.getTracks().forEach(t => t.stop()); stream = null;
+    peer?.destroy(); viewers.clear();
+    setLive(false, "Preview appears here while you stream.");
+    $("startBtn").classList.remove("hidden"); $("stopBtn").classList.add("hidden");
+    setStatus("Stream stopped.");
+  }
+  $("startBtn").onclick = start;
+  $("stopBtn").onclick = stop;
+}
+
+location.hash === "#broadcast" ? broadcaster() : viewer();
+addEventListener("hashchange", () => location.reload());
+</script>
+</body>
+</html>
